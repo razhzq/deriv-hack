@@ -1,5 +1,4 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import requests
 from bs4 import BeautifulSoup
@@ -9,19 +8,15 @@ from enum import Enum
 import statistics
 from transformers import pipeline
 import websockets
-from fastapi import Request
 import json
-import time 
-import finnhub
-from datetime import datetime
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, validator
-from typing import Optional
+from pydantic import BaseModel
 import pandas as pd
 from statsmodels.tsa.arima.model import ARIMA
 import yfinance as yf
+from forex_python.converter import CurrencyCodes
 
-finnhub_client= finnhub.Client(api_key='csnjkapr01qqapaib5vgcsnjkapr01qqapaib600')
+currency = CurrencyCodes()
 
 app = FastAPI()
 
@@ -44,9 +39,9 @@ class NewsResponse(BaseModel):
     risk_assessment: str
 
 class CurrencyRequest(BaseModel):
-    currency: str  # Currency pair to analyze, e.g. 'USD/EUR'
+    currency: str  # Currency pair to analyze, e.g., 'USD/EUR'
+    duration: str  # Duration for prediction: '1d', '1wk', '1mo', '1yr'
      
-
 # Initialize sentiment analyzer
 sentiment_analyzer = pipeline("sentiment-analysis", model="finiteautomata/bertweet-base-sentiment-analysis")
 
@@ -131,8 +126,7 @@ async def fetch_data_from_websocket(custom_request: dict):
         print(f"[error] {str(e)}")
         raise HTTPException(status_code=500, detail="Error fetching data from WebSocket")
 
-@app.get("/news/{currency}", response_model=NewsResponse)
-async def get_stock_news(currency: str, limit: int = 4):
+def get_stock_news(currency: str, limit: int = 4):
     """
     Fetch and analyze recent news about stocks for a given company
     
@@ -148,7 +142,9 @@ async def get_stock_news(currency: str, limit: int = 4):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36'
         }
 
-        query_url = google_query(currency)
+        currency_full = get_currency_pair_full_name(currency)
+
+        query_url = google_query(currency_full)
         response = requests.get(query_url, headers=headers)
         
         if response.status_code != 200:
@@ -217,18 +213,18 @@ async def get_stock_news(currency: str, limit: int = 4):
         )
     
 
-def fetch_forex_data(currency: str):
+def fetch_forex_data(currency, period="1mo", interval="1d"):
     """
     Fetches historical forex data for the given currency pair from Yahoo Finance.
     Converts currency format to Yahoo Finance style (e.g. USD/EUR -> USDEUR=X).
     """
 
     try:
-            # Convert the currency pair to the Yahoo Finance symbol format
+        # Convert the currency pair to the Yahoo Finance symbol format
         formatted_currency = currency.replace("/", "") + "=X"
         
         # Use Yahoo Finance's API to download historical forex data
-        data = yf.download(formatted_currency, period="1mo", interval="1d")
+        data = yf.download(formatted_currency, period=period, interval=interval)
         if data.empty:
             raise HTTPException(
                 status_code=404,
@@ -257,7 +253,7 @@ def fetch_forex_data(currency: str):
         )
 
 
-def analyze_prices_with_arima(prices: list, currency: str):
+def analyze_prices_with_arima(prices, currency, forecast_steps):
     """
     Analyzes price data using ARIMA and returns forecasted data and sentiment.
     """
@@ -265,7 +261,6 @@ def analyze_prices_with_arima(prices: list, currency: str):
         data = pd.Series(prices)
         model = ARIMA(data, order=(1, 1, 1))
         model_fit = model.fit()
-        forecast_steps = 10
         forecast = model_fit.forecast(steps=forecast_steps).reset_index()
         predicted_price = float(forecast.iloc[0,1])  # Convert numpy float to Python float
         daily_high = float(max(data))
@@ -290,15 +285,72 @@ def analyze_prices_with_arima(prices: list, currency: str):
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         )
+    
+# Function to convert a currency pair to its full names
+def get_currency_pair_full_name(currency_pair: str) -> str:
+    """
+    Convert a currency pair code (e.g., 'AUD/JPY') to full names (e.g., 'AUD (Australian Dollar) / JPY (Japanese Yen)').
 
+    Parameters:
+    - currency_pair: str, the currency pair code in the format 'CURRENCY1/CURRENCY2'
+
+    Returns:
+    - str, formatted string with full names of both currencies
+    """
+    try:
+        # Split the currency pair into two codes
+        currency1, currency2 = currency_pair.split('/')
+
+        # Get the full names for each currency code
+        currency1_name = currency.get_currency_name(currency1) or "Unknown currency"
+        currency2_name = currency.get_currency_name(currency2) or "Unknown currency"
+
+        # Format and return the result
+        return f"{currency1} ({currency1_name}) / {currency2} ({currency2_name})"
+    
+    except ValueError:
+        return "Invalid currency pair format. Please use 'CURRENCY1/CURRENCY2' format."
+    
 
 @app.post("/analyze")
 async def analyze_currency(request: CurrencyRequest):
     """
-    Analyzes a currency pair and returns price predictions and sentiment.
+    Endpoint to analyze a currency pair with specified prediction duration.
     """
-    prices = fetch_forex_data(request.currency)
-    return analyze_prices_with_arima(prices, request.currency)
+    currency = request.currency
+    duration = request.duration.lower()
+
+    # Set forecast steps based on duration
+    forecast_steps = {
+        "1d": 1,      # Predict the next day
+        "1wk": 7,     # Predict the next 7 days
+        "1mo": 30,    # Predict the next 30 days
+        "1yr": 365    # Predict the next 365 days
+    }.get(duration)
+
+    if not forecast_steps:
+        raise HTTPException(status_code=400, detail="Invalid duration. Choose from '1d', '1wk', '1mo', or '1yr'.")
+
+    # Set period for historical data based on duration
+    period = {
+        "1d": "1mo",  # For 1-day prediction, use 1 month of data
+        "1wk": "3mo", # For 1-week prediction, use 3 months of data
+        "1mo": "6mo", # For 1-month prediction, use 6 months of data
+        "1yr": "2y"   # For 1-year prediction, use 2 years of data
+    }[duration]
+
+    # Fetch historical forex data
+    prices = fetch_forex_data(currency, period=period)
+    if isinstance(prices, list):  # Check if valid prices were returned
+        analysis = analyze_prices_with_arima(prices, currency, forecast_steps)
+
+        sentiment_news = get_stock_news(request.currency)
+
+        analysis.update(sentiment_news)
+
+        return analysis
+    else:
+        return prices  # Return error message if prices retrieval failed
 
 
 @app.get("/")
