@@ -11,6 +11,18 @@ from transformers import pipeline
 import websockets
 from fastapi import Request
 import json
+import time 
+import finnhub
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, validator
+from typing import Optional
+import pandas as pd
+from statsmodels.tsa.arima.model import ARIMA
+import yfinance as yf
+
+finnhub_client= finnhub.Client(api_key='csnjkapr01qqapaib5vgcsnjkapr01qqapaib600')
+
 app = FastAPI()
 
 class SentimentType(str, Enum):
@@ -31,6 +43,9 @@ class NewsResponse(BaseModel):
     average_sentiment_score: float
     risk_assessment: str
 
+class CurrencyRequest(BaseModel):
+    currency: str  # Currency pair to analyze, e.g. 'USD/EUR'
+     
 
 # Initialize sentiment analyzer
 sentiment_analyzer = pipeline("sentiment-analysis", model="finiteautomata/bertweet-base-sentiment-analysis")
@@ -79,10 +94,18 @@ def assess_risk(sentiment_scores: List[float], overall_sentiment: SentimentType)
     return risk
 
 def google_query(search_term: str) -> str:
-    if "news" not in search_term:
-        search_term = search_term + " stock news"
-    url = f"https://www.google.com/search?q={search_term}&cr=countryIN"
+    search_term = search_term + ' currency'
+    url = f"https://news.google.com/search?q={search_term}&hl=en-US&gl=US&ceid=US%3Aen"
     return re.sub(r"\s", "+", url)
+   
+# Encode special characters in a text string
+def encode_special_characters(text):
+    encoded_text = ''
+    special_characters = {'&': '%26', '=': '%3D', '+': '%2B', ' ': '%20'}  # Add more special characters as needed
+    for char in text.lower():
+        encoded_text += special_characters.get(char, char)
+    return encoded_text
+
 
 async def fetch_data_from_websocket(custom_request: dict):
     app_id = 16929  # Replace with your app_id
@@ -108,8 +131,8 @@ async def fetch_data_from_websocket(custom_request: dict):
         print(f"[error] {str(e)}")
         raise HTTPException(status_code=500, detail="Error fetching data from WebSocket")
 
-@app.get("/stock-news/{company_name}", response_model=NewsResponse)
-async def get_stock_news(company_name: str, limit: int = 4):
+@app.get("/news/{currency}", response_model=NewsResponse)
+async def get_stock_news(currency: str, limit: int = 4):
     """
     Fetch and analyze recent news about stocks for a given company
     
@@ -125,7 +148,7 @@ async def get_stock_news(company_name: str, limit: int = 4):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36'
         }
 
-        query_url = google_query(company_name)
+        query_url = google_query(currency)
         response = requests.get(query_url, headers=headers)
         
         if response.status_code != 200:
@@ -137,10 +160,16 @@ async def get_stock_news(company_name: str, limit: int = 4):
         soup = BeautifulSoup(response.text, "html.parser")
         raw_news = []
 
-        for div_class in ["n0jPhd ynAwRc tNxQIb nDgy9d", "IJl0Z"]:
-            raw_news.extend([n.text for n in soup.find_all("div", div_class)])
+        articles = soup.find_all('article')
+        links = [article.find('a')['href'] for article in articles]
+        links = [link.replace("./articles/", "https://news.google.com/articles/") for link in links]
 
-        raw_news = raw_news[:limit] if len(raw_news) > limit else raw_news
+        news_text = [article.get_text(separator='\n') for article in articles]
+        news_text_split = [text.split('\n') for text in news_text]
+
+        titles = [text[2] for text in news_text_split]
+
+        raw_news = titles[:limit] if len(titles) > limit else titles
         
         # Analyze sentiment for each news item
         analyzed_news = []
@@ -168,7 +197,7 @@ async def get_stock_news(company_name: str, limit: int = 4):
         risk_assessment = assess_risk(sentiment_scores, overall_sentiment)
 
         return NewsResponse(
-            company_name=company_name,
+            company_name=currency,
             news_items=analyzed_news,
             total_news=len(analyzed_news),
             overall_sentiment=overall_sentiment,
@@ -188,15 +217,89 @@ async def get_stock_news(company_name: str, limit: int = 4):
         )
     
 
-@app.post("/fetch-deriv-data")
-async def fetch_ticks_history(request: Request):
-    # Define your custom JSON request here (or pass as request body for flexibility)
-    custom_request = await request.json()
+def fetch_forex_data(currency: str):
+    """
+    Fetches historical forex data for the given currency pair from Yahoo Finance.
+    Converts currency format to Yahoo Finance style (e.g. USD/EUR -> USDEUR=X).
+    """
 
-    # Call the WebSocket connection function
-    response = await fetch_data_from_websocket(custom_request)
+    try:
+            # Convert the currency pair to the Yahoo Finance symbol format
+        formatted_currency = currency.replace("/", "") + "=X"
+        
+        # Use Yahoo Finance's API to download historical forex data
+        data = yf.download(formatted_currency, period="1mo", interval="1d")
+        if data.empty:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No data found for currency pair {currency}"
+            )
+        
+        # Extract the 'Close' prices
+        prices = data['Close'].dropna().astype(float).to_dict()
+
+        price_list = pd.DataFrame(prices).iloc[:,0].to_list()
+
+        print(price_list)
+        
+        if not prices:
+            raise HTTPException(
+                status_code=404,
+                detail="No valid price data available"
+            )
+        
+        return price_list
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+
+def analyze_prices_with_arima(prices: list, currency: str):
+    """
+    Analyzes price data using ARIMA and returns forecasted data and sentiment.
+    """
+    try:
+        data = pd.Series(prices)
+        model = ARIMA(data, order=(1, 1, 1))
+        model_fit = model.fit()
+        forecast_steps = 10
+        forecast = model_fit.forecast(steps=forecast_steps).reset_index()
+        predicted_price = float(forecast.iloc[0,1])  # Convert numpy float to Python float
+        daily_high = float(max(data))
+        daily_low = float(min(data))
+
+        sentiment = "Neutral"
+        if predicted_price > daily_high:
+            sentiment = "Bullish"
+        elif predicted_price < daily_low:
+            sentiment = "Bearish"
+
+        return {
+            "currency": currency,
+            "predicted_price": predicted_price,
+            "daily_high": daily_high,
+            "daily_low": daily_low,
+            "sentiment": sentiment
+        }
     
-    return response
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+
+@app.post("/analyze")
+async def analyze_currency(request: CurrencyRequest):
+    """
+    Analyzes a currency pair and returns price predictions and sentiment.
+    """
+    prices = fetch_forex_data(request.currency)
+    return analyze_prices_with_arima(prices, request.currency)
+
 
 @app.get("/")
 async def root():
