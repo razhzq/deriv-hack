@@ -43,7 +43,7 @@ class CurrencyRequest(BaseModel):
     duration: str  # Duration for prediction: '1d', '1wk', '1mo', '1yr'
      
 # Initialize sentiment analyzer
-sentiment_analyzer = pipeline("sentiment-analysis", model="finiteautomata/bertweet-base-sentiment-analysis")
+sentiment_analyzer = pipeline("sentiment-analysis", model="AnkitAI/distilbert-base-uncased-financial-news-sentiment-analysis")
 
 def analyze_sentiment(text: str) -> tuple[SentimentType, float]:
     """
